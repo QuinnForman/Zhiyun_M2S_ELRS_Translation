@@ -1,0 +1,142 @@
+#include <Wire.h>
+#include <Adafruit_MCP4728.h>
+
+// ---------- Pins ----------
+const int SDA_PIN     = 8;
+const int SCL_PIN     = 9;
+const int CRSF_RX_PIN = 14;                  // receiver TX -> ESP32 GPIO 14
+
+// ---------- Axis config ----------
+struct Axis {
+  int   ch;            // CRSF channel index, 0-based
+  bool  reverse;       // flip direction
+  float restV;         // wiper voltage at rest
+  float deadV;         // gimbal deadband half-width in volts
+  float minV, maxV;    // output limits
+  MCP4728_channel_t dacCh;
+  float target;        // latest commanded voltage
+  float cur;           // slew-limited output
+};
+
+Axis tilt = {1, true, 1.65f, 0.0f, 0.02f, 3.28f, MCP4728_CHANNEL_B, 1.65f, 1.65f};
+Axis pan  = {3, false, 1.65f, 0.0f, 0.02f, 3.28f, MCP4728_CHANNEL_A, 1.65f, 1.65f};
+// (rest, up/down voltages) before connecting the gimbal.
+
+const float    VCC        = 3.3f;
+const int      RADIO_DEAD = 6;               // CRSF units around center to ignore
+const uint32_t TIMEOUT_MS = 300;
+const float    SLEW_STEP  = 0.05f;           // max volts per 10 ms update
+
+// ---------- CRSF ----------
+HardwareSerial crsf(1);
+uint8_t  buf[64];
+uint8_t  pos = 0;
+uint32_t lastFrame = 0;
+uint16_t ch[16];
+bool     linkUp = false;
+
+Adafruit_MCP4728 dac;
+
+uint8_t crc8(const uint8_t *p, uint8_t len) {
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *p++;
+    for (int i = 0; i < 8; i++) crc = (crc & 0x80) ? (crc << 1) ^ 0xD5 : crc << 1;
+  }
+  return crc;
+}
+
+float mapChannel(const Axis &a, int raw) {
+  int d = raw - 992;
+  if (abs(d) < RADIO_DEAD) return a.restV;
+  float n = constrain(d / 819.0f, -1.0f, 1.0f);
+  if (a.reverse) n = -n;
+  float room = (n > 0 ? (a.maxV - a.restV) : (a.restV - a.minV)) - a.deadV;
+  return a.restV + (n > 0 ? 1.0f : -1.0f) * (a.deadV + fabsf(n) * room);
+}
+
+void writeVolts(const Axis &a, float v) {
+  v = constrain(v, a.minV, a.maxV);
+  uint16_t code = (uint16_t)roundf(v / VCC * 4095.0f);
+  dac.setChannelValue(a.dacCh, code, MCP4728_VREF_VDD, MCP4728_GAIN_1X);
+}
+
+void parseFrame(uint8_t *f) {
+  if (f[2] != 0x16) return;                  // RC channels only
+  uint8_t *p = &f[3];
+  uint32_t bits = 0; uint8_t nb = 0, idx = 0;
+  for (int i = 0; i < 22 && idx < 16; i++) {
+    bits |= (uint32_t)p[i] << nb; nb += 8;
+    while (nb >= 11 && idx < 16) { ch[idx++] = bits & 0x7FF; bits >>= 11; nb -= 11; }
+  }
+  tilt.target = mapChannel(tilt, ch[tilt.ch]);
+  pan.target  = mapChannel(pan,  ch[pan.ch]);
+  lastFrame = millis();
+}
+
+float slew(float cur, float target) {
+  if (target > cur + SLEW_STEP) return cur + SLEW_STEP;
+  if (target < cur - SLEW_STEP) return cur - SLEW_STEP;
+  return target;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  if (!dac.begin(0x60, &Wire)) {
+    Serial.println("MCP4728 not found, check wiring");
+    while (true) delay(100);
+  }
+  writeVolts(tilt, tilt.restV);              // start at rest before anything else
+  writeVolts(pan,  pan.restV);
+
+  crsf.begin(420000, SERIAL_8N1, CRSF_RX_PIN, -1);
+  Serial.println("Gimbal controller ready");
+}
+
+void loop() {
+  // ----- read CRSF -----
+  while (crsf.available()) {
+    uint8_t b = crsf.read();
+    if (pos == 0 && b != 0xC8 && b != 0xEE) continue;
+    buf[pos++] = b;
+    if (pos >= 2) {
+      uint8_t total = buf[1] + 2;
+      if (total > sizeof(buf) || total < 4) { pos = 0; continue; }
+      if (pos == total) {
+        if (crc8(&buf[2], buf[1] - 1) == buf[total - 1]) parseFrame(buf);
+        pos = 0;
+      }
+    }
+  }
+
+  // ----- update outputs at 100 Hz -----
+  static uint32_t tOut = 0;
+  if (millis() - tOut >= 10) {
+    tOut = millis();
+    bool up = (millis() - lastFrame) < TIMEOUT_MS;
+    float tT = up ? tilt.target : tilt.restV;   // failsafe: back to rest
+    float tP = up ? pan.target  : pan.restV;
+    tilt.cur = slew(tilt.cur, tT);
+    pan.cur  = slew(pan.cur,  tP);
+    writeVolts(tilt, tilt.cur);
+    writeVolts(pan,  pan.cur);
+
+    if (up != linkUp) {
+      linkUp = up;
+      Serial.println(up ? ">>> LINK UP" : ">>> LINK LOST, outputs to rest");
+    }
+  }
+
+  // ----- debug print at 5 Hz -----
+  static uint32_t tDbg = 0;
+  if (millis() - tDbg >= 200) {
+    tDbg = millis();
+    if (linkUp)
+      Serial.printf("CH2=%4u -> A %.3f V   CH4=%4u -> B %.3f V\n",
+                    ch[tilt.ch], tilt.cur, ch[pan.ch], pan.cur);
+  }
+}
